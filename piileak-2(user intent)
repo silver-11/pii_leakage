@@ -1,0 +1,406 @@
+"""
+PII Scanner v6
+─────────────
+Root causes fixed from v5:
+
+  BUG 1 — TECHNICAL_CONTEXT_RE had closing \\b → 'dimensions' never matched 'dimension'
+           Fix: s? plurals on each word, drop trailing \\b
+
+  BUG 2 — Validators called with empty sentence when spaCy can't segment short text
+           Fix: validator receives (sentence or full_text) as fallback
+
+  BUG 3 — low_risk_veto (max_low > 0.28 → cap 0.55) ran BEFORE keyword floor
+           'confidential' scored high on 'masked/redacted' label → veto fired → floor couldn't rescue
+           Fix: keyword floor applied AFTER veto, as a hard override
+
+  BUG 4 — PII_KEYWORDS_RE missing bare 'PAN', 'KYC', 'email', 'leaked', 'confidential'
+           Fix: expanded keyword list + added EXPOSURE_CONTEXT_RE for exposure verbs
+
+  BUG 5 — SSN test used area code 987 (>= 900 → invalid by SSA rules) → validator rejected it
+           Fix: SSN validator now only rejects area 000 and 666 (the truly reserved ranges)
+           Rationale: leaked SSNs don't stop being leaks because the number is technically invalid
+
+  BUG 6 — Same as BUG 3, affected 'Aadhaar card ... WhatsApp group'
+
+Dependencies:
+    pip install spacy transformers torch
+    python -m spacy download en_core_web_sm
+"""
+
+import re
+import spacy
+from transformers import pipeline
+from functools import lru_cache
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+nlp = spacy.load("en_core_web_sm")
+
+NLI_MODELS = [
+    "facebook/bart-large-mnli",
+    "cross-encoder/nli-deberta-v3-small",
+    "typeform/distilbert-base-uncased-mnli",
+]
+
+def load_nli(models=NLI_MODELS):
+    for model_id in models:
+        try:
+            print(f"Loading: {model_id} ...")
+            p = pipeline("zero-shot-classification", model=model_id, device=-1)
+            print(f"✓ {model_id}\n")
+            return p
+        except Exception as e:
+            print(f"✗ {model_id}: {e}")
+    raise RuntimeError("All NLI models failed.")
+
+nli = load_nli()
+
+# ---------------------------------------------------------------------------
+# PII patterns
+# ---------------------------------------------------------------------------
+
+PII_PATTERNS = {
+    "AADHAAR":     r"(?<!\d)[1-9]\d{3}[\s\-]?\d{4}[\s\-]?\d{4}(?!\d)",
+    "PAN":         r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
+    "PASSPORT_IN": r"\b[A-PR-WY][1-9]\d{6}\b",
+    "VOTER_ID":    r"\b[A-Z]{3}[0-9]{7}\b",
+    "DL_IN":       r"\b[A-Z]{2}[0-9]{2}\s?[0-9]{11}\b",
+    "SSN":         r"(?<![\d.])\b\d{3}-\d{2}-\d{4}\b(?![\d.])",
+    "CREDIT_CARD": r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|6011[0-9]{12}|3[47][0-9]{13})\b",
+    "IFSC":        r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+    "EMAIL":       r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    "PHONE":       r"(?<!\d)(\+91[-\s]?)?[6-9]\d{9}(?!\d)",
+}
+
+# ---------------------------------------------------------------------------
+# NLI labels
+# ---------------------------------------------------------------------------
+
+HIGH_RISK_LABELS = {
+    "someone's real personal information being shared or exposed",
+    "private data accidentally or intentionally disclosed",
+    "sensitive information belonging to a real individual",
+}
+MID_RISK_LABELS = {
+    "information that may or may not be real personal data",
+}
+LOW_RISK_LABELS = {
+    "a fictional, fake, or made-up example used for illustration",
+    "masked, redacted, or anonymised data",
+    "technical documentation or format specification",
+}
+CANDIDATE_LABELS = list(HIGH_RISK_LABELS | MID_RISK_LABELS | LOW_RISK_LABELS)
+
+# ---------------------------------------------------------------------------
+# Signal regexes  (BUG 1 fixed: plural s?, no trailing \b on tech regex)
+# ---------------------------------------------------------------------------
+
+OWNERSHIP_RE = re.compile(
+    r"\b(my|his|her|your|their|our|client'?s?|customer'?s?|user'?s?)\b",
+    re.IGNORECASE,
+)
+
+MASKED_VALUE_RE = re.compile(r"[xX\*]{3,}|xxxx|\*{3,}", re.IGNORECASE)
+
+DUMMY_CONTEXT_RE = re.compile(
+    r"\b(dummy|fake|test\s+data|test\s+card|sample|demo|placeholder|"
+    r"for\s+illustration|not\s+real|fictitious|mock[\s\-]?up|"
+    r"documentation\s+example|format\s+example|use\s+\S+\s+as\s+a)\b",
+    re.IGNORECASE,
+)
+
+# BUG 1 FIX: s? plurals, no trailing \b
+TECHNICAL_CONTEXT_RE = re.compile(
+    r"\b(dimensions?|ratios?|resolutions?|versions?|v\d+|subnets?|"
+    r"ip\s+address|weights?|heights?|widths?|pixels?|px|cm|mm|inches?|"
+    r"sizes?|configs?|coordinates?|measurements?)\b",
+    re.IGNORECASE,
+)
+
+# BUG 4 FIX: expanded PII keyword list — now includes bare 'PAN', 'KYC', exposure words
+PII_KEYWORDS_RE = re.compile(
+    r"\b(aadhaar|aadhar|pan\b|kyc|passport|voter\s?id|"
+    r"driving\s?licen[cs]e|credit\s?card|debit\s?card|"
+    r"bank\s?account|ifsc|ssn|social\s?security|"
+    r"phone\s?number|mobile\s?number|whatsapp|"
+    r"email\s+address|my\s+email|email\s+was|email\s+got|"
+    r"confidential|leaked|disclosed|exposed|accidentally|mistakenly)\b",
+    re.IGNORECASE,
+)
+
+PII_KEYWORD_FLOOR = 0.70  # applied AFTER veto (BUG 3 fix)
+
+# ---------------------------------------------------------------------------
+# Post-match validators  (BUG 2 fix: accept fallback_text)
+# ---------------------------------------------------------------------------
+
+def valid_aadhaar(value: str, context: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    if len(digits) != 12 or digits[0] in "01":
+        return False
+    if re.search(r"\b(account|a/c|card|dimension|size|px|cm|mm|inches)\b", context, re.I):
+        return False
+    return True
+
+def valid_ssn(value: str, context: str) -> bool:
+    parts = value.split("-")
+    if len(parts) != 3:
+        return False
+    area, group, serial = parts
+    area_int = int(area)
+    # BUG 5 FIX: only reject truly reserved areas (000, 666) not the 900+ range
+    # 900+ are ITIN numbers which can still appear in leaks
+    if area_int == 0 or area_int == 666:
+        return False
+    if int(group) == 0 or int(serial) == 0:
+        return False
+    if TECHNICAL_CONTEXT_RE.search(context):
+        return False
+    if DUMMY_CONTEXT_RE.search(context):
+        return False
+    return True
+
+def valid_phone(value: str, context: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    return len(digits) == 10 and digits[0] in "6789"
+
+VALIDATORS = {
+    "AADHAAR": valid_aadhaar,
+    "SSN":     valid_ssn,
+    "PHONE":   valid_phone,
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_sentence(doc, span_start: int, span_end: int) -> str:
+    for sent in doc.sents:
+        if span_start >= sent.start_char and span_end <= sent.end_char:
+            return sent.text
+    return ""
+
+def get_nearby_ner(doc, span_start: int, span_end: int) -> list[str]:
+    return [
+        ent.label_ for ent in doc.ents
+        if ent.start_char >= span_start - 200 and ent.end_char <= span_end + 200
+    ]
+
+@dataclass
+class NLIResult:
+    top_label: str
+    top_score: float
+    distribution: dict[str, float]
+    high_risk_mass: float
+    low_risk_mass: float
+
+@lru_cache(maxsize=512)
+def run_nli(sentence: str) -> NLIResult:
+    result = nli(sentence, candidate_labels=CANDIDATE_LABELS)
+    dist = dict(zip(result["labels"], result["scores"]))
+    high_mass = sum(dist.get(l, 0) for l in HIGH_RISK_LABELS)
+    low_mass  = sum(dist.get(l, 0) for l in LOW_RISK_LABELS)
+    return NLIResult(
+        top_label=result["labels"][0],
+        top_score=result["scores"][0],
+        distribution=dist,
+        high_risk_mass=high_mass,
+        low_risk_mass=low_mass,
+    )
+
+# ---------------------------------------------------------------------------
+# Risk computation  (BUG 3 fix: keyword floor applied AFTER veto)
+# ---------------------------------------------------------------------------
+
+def compute_risk(
+    sentence: str,
+    matched_text: str,
+    pii_type: str,
+    full_text: str,
+    nearby_ner: list[str],
+) -> tuple[float, str, dict[str, float]]:
+
+    context = sentence or full_text  # BUG 2 fix: fallback to full text
+
+    # Masked value → always suppress
+    if MASKED_VALUE_RE.search(matched_text):
+        return 0.05, "masked value", {}
+
+    # Dummy sentence context → suppress (checked before HIGH_RISK bypass)
+    if DUMMY_CONTEXT_RE.search(context):
+        return 0.10, "dummy context", {}
+
+    # Credit card bypass NLI
+    if pii_type == "CREDIT_CARD":
+        return 0.87, "high-risk structural type", {}
+
+    # No sentence context
+    if not sentence.strip():
+        base_risk = 0.65
+        label = "no sentence context"
+        dist = {}
+    else:
+        nli_result = run_nli(sentence)
+        dist = nli_result.distribution
+        base_risk = nli_result.high_risk_mass
+        label = nli_result.top_label
+
+        # Low-risk veto: model clearly thinks it's dummy/doc
+        max_low = max((dist.get(l, 0) for l in LOW_RISK_LABELS), default=0)
+        if max_low > 0.28:
+            base_risk = min(base_risk, 0.52)
+
+    # BUG 3 FIX: keyword floor applied AFTER veto — hard override
+    if PII_KEYWORDS_RE.search(context):
+        base_risk = max(base_risk, PII_KEYWORD_FLOOR)
+
+    # Ownership boost
+    if OWNERSHIP_RE.search(context):
+        base_risk = min(base_risk + 0.10, 1.0)
+
+    # PERSON entity nearby
+    if "PERSON" in nearby_ner:
+        base_risk = min(base_risk + 0.07, 1.0)
+
+    return round(base_risk, 3), label, dist
+
+
+def severity(score: float) -> str | None:
+    if score >= 0.82:
+        return "CONFIRMED_LEAK"
+    elif score >= 0.58:
+        return "PROBABLE_LEAK"
+    return None
+
+# ---------------------------------------------------------------------------
+# Main scanner
+# ---------------------------------------------------------------------------
+
+def hybrid_scan(text: str) -> list[dict]:
+    doc = nlp(text)
+    findings = []
+
+    for pii_type, pattern in PII_PATTERNS.items():
+        for match in re.finditer(pattern, text):
+            span_start, span_end = match.start(), match.end()
+            sentence   = get_sentence(doc, span_start, span_end)
+            nearby_ner = get_nearby_ner(doc, span_start, span_end)
+
+            # BUG 2 FIX: pass (sentence or full text) as context to validator
+            context = sentence or text
+            validator = VALIDATORS.get(pii_type)
+            if validator and not validator(match.group(), context):
+                continue
+
+            risk_score, reason, dist = compute_risk(
+                sentence, match.group(), pii_type, text, tuple(nearby_ner)
+            )
+
+            sev = severity(risk_score)
+            if sev is None:
+                continue
+
+            findings.append({
+                "type":         pii_type,
+                "value":        match.group(),
+                "sentence":     sentence.strip() or "[no sentence]",
+                "risk_score":   risk_score,
+                "severity":     sev,
+                "decision":     reason,
+                "distribution": dist,
+            })
+
+    return findings
+
+# ---------------------------------------------------------------------------
+# Pretty printer
+# ---------------------------------------------------------------------------
+
+def print_finding(r: dict):
+    print(f"  ▶ [{r['severity']}] {r['type']}  score={r['risk_score']}  «{r['decision']}»")
+    if r["distribution"]:
+        sorted_dist = sorted(r["distribution"].items(), key=lambda x: -x[1])
+        for lbl, score in sorted_dist:
+            bar  = "█" * int(score * 22)
+            tier = "H" if lbl in HIGH_RISK_LABELS else ("L" if lbl in LOW_RISK_LABELS else "M")
+            flag = " ◀" if score == max(r["distribution"].values()) else ""
+            print(f"    [{tier}] {score:.3f} {bar:<22}  {lbl}{flag}")
+    print()
+
+# ---------------------------------------------------------------------------
+# Test suite
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    tests = [
+        # ── SHOULD SURFACE ────────────────────────────────────────────────
+        ("SURFACE", "My Aadhaar is 3456 7890 1234 – please don't save or forward it."),
+        ("SURFACE", "Aadhaar number 876543210987 should be kept confidential."),
+        ("SURFACE", "Her Aadhaar 5432 1098 7654 appeared in public gist by mistake."),
+        ("SURFACE", "Aadhaar card 8901 2345 6789 shared in family WhatsApp group."),
+        ("SURFACE", "Aadhaar 4321-0987-6543 was mistakenly shared in email."),
+        ("SURFACE", "Kindly use 5678 9012 3456 for KYC but delete after use."),
+        ("SURFACE", "My PAN is FGHIJ1234K, submitting only for this transaction."),
+        ("SURFACE", "PAN ABCPS9999R was accidentally visible in the zoom background."),
+        ("SURFACE", "Don't share my number +919000112233 under any circumstances."),
+        ("SURFACE", "WhatsApp: 9876540321 – don't share with anyone else."),
+        ("SURFACE", "Email confidential@personal.in was leaked in old forum post."),
+        ("SURFACE", "My recovery email secondary.user@yahoo.in got exposed."),
+        ("SURFACE", "Official mail: finance.team@startup.in – confidential only."),
+        ("SURFACE", "Credit card 4346789012345678 expiry 09/27 CVV 456"),
+        ("SURFACE", "SSN 078-05-1120 – this is my actual number, keep safe."),   # BUG 5: valid area code
+        ("SURFACE", "Bank account 624301234567 – IFSC CORP0000624 transfer pending."),
+
+        # ── SHOULD SUPPRESS ───────────────────────────────────────────────
+        ("SUPPRESS", "SSN 987-65-4321 used as dummy data – do NOT use real ones."),
+        ("SUPPRESS", "My full Aadhaar is 1111 2222 3333 – obviously dummy but still."),
+        ("SUPPRESS", "Please use temp.testing2025@gmail.com for this demo."),
+        ("SUPPRESS", "Aadhaar XXXX XXXX 9876 – is this safe to show?"),
+        ("SUPPRESS", "Card **** **** **** 7890 CVV not required for this test."),
+        ("SUPPRESS", "The SSN format is 123-45-6789, used only as a documentation example."),
+
+        # ── COLLISION / FALSE POSITIVE ────────────────────────────────────
+        ("SUPPRESS", "The dimensions are 192-23-4521 for the component."),        # BUG 1 fix
+        ("SUPPRESS", "Resolution: 3840-21-2160 pixels wide."),
+        ("SUPPRESS", "Account 9200200123456789 — note the 16-digit format."),
+        ("SUPPRESS", "Her card number is 4111111111111111 — this is a test card from Stripe docs."),
+        ("SUPPRESS", "Use 123-45-6789 as a placeholder SSN in your form mock-up."),
+        ("SUPPRESS", "Version 123-45-6789 of the library was deprecated."),
+        ("SUPPRESS", "The ratio is 192-168-001 as per the subnet config."),
+    ]
+
+    print(f"\n{'='*72}")
+    print("  PII SCANNER v6  |  bart-large-mnli  |  6 bugs fixed")
+    print(f"{'='*72}\n")
+
+    correct, wrong = 0, []
+
+    for expected, text in tests:
+        results = hybrid_scan(text)
+        actual  = "SURFACE" if results else "SUPPRESS"
+        ok      = actual == expected
+        if ok:
+            correct += 1
+        else:
+            wrong.append((expected, actual, text))
+
+        status = "✓" if ok else "✗"
+        print(f"{status} [{expected}]  {text[:70]}")
+        if results:
+            for r in results:
+                print_finding(r)
+        else:
+            print("  → suppressed\n")
+
+    print(f"\n{'='*72}")
+    print(f"  Score: {correct}/{len(tests)}")
+    if wrong:
+        print(f"\n  Still wrong ({len(wrong)}):")
+        for exp, act, txt in wrong:
+            print(f"    • expected={exp} got={act}  {txt[:65]}")
+    print(f"{'='*72}\n")
